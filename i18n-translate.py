@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-i18n JSON AI Translator v1.0
+i18n JSON AI Translator v1.1
 Translates all text values in nested i18n JSON files using a local Ollama instance.
 
 Usage:
@@ -10,6 +10,8 @@ Examples:
   python3 i18n-translate.py en.json http://localhost:11434 --lang German --out de.json
   python3 i18n-translate.py en.json http://localhost:11434 --lang Spanish --out es.json --model qwen3:8b
   python3 i18n-translate.py en.json http://localhost:11434 --lang French --out fr.json --scope pages.home
+    print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --missing-only")
+  python3 i18n-translate.py en.json http://localhost:11434 --lang German --out de.json --missing-only
 """
 
 import sys
@@ -20,7 +22,7 @@ import urllib.request
 import urllib.parse
 import urllib.error
 
-VERSION = "1.0"
+VERSION = "1.1"
 
 # ANSI colors
 RED    = "\033[91m"
@@ -98,17 +100,64 @@ def set_nested_value(data, key_path: str, new_value: str):
     obj = data
     for part in parts[:-1]:
         m = re.match(r'^(.*)\[(\d+)\]$', part)
-        obj = obj[m.group(1)][int(m.group(2))] if m else obj[part]
+        if m:
+            key, idx = m.group(1), int(m.group(2))
+            if key not in obj:
+                obj[key] = []
+            while len(obj[key]) <= idx:
+                obj[key].append({})
+            obj = obj[key][idx]
+        else:
+            if part not in obj or not isinstance(obj[part], dict):
+                obj[part] = {}
+            obj = obj[part]
     last = parts[-1]
     m = re.match(r'^(.*)\[(\d+)\]$', last)
     if m:
-        obj[m.group(1)][int(m.group(2))] = new_value
+        key, idx = m.group(1), int(m.group(2))
+        if key not in obj:
+            obj[key] = []
+        while len(obj[key]) <= idx:
+            obj[key].append("")
+        obj[key][idx] = new_value
     else:
         obj[last] = new_value
 
 def deep_copy_structure(data):
     """Deep copy JSON-serialisable structure."""
     return json.loads(json.dumps(data))
+
+def get_nested_value(data, key_path: str):
+    """
+    Walk into data using the same dotted/bracketed key_path used by set_nested_value.
+    Returns the value, or None if any part of the path is missing.
+    """
+    parts = re.split(r'\.(?![^\[]*\])', key_path)
+    obj = data
+    for part in parts:
+        m = re.match(r'^(.*)\[(\d+)\]$', part)
+        if m:
+            key, idx = m.group(1), int(m.group(2))
+            if not isinstance(obj, dict) or key not in obj:
+                return None
+            obj = obj[key]
+            if not isinstance(obj, list) or idx >= len(obj):
+                return None
+            obj = obj[idx]
+        else:
+            if not isinstance(obj, dict) or part not in obj:
+                return None
+            obj = obj[part]
+    return obj
+
+def is_missing_or_empty(data, key_path: str) -> bool:
+    """Return True if the key doesn't exist in data or its value is an empty/whitespace string."""
+    val = get_nested_value(data, key_path)
+    if val is None:
+        return True
+    if isinstance(val, str) and not val.strip():
+        return True
+    return False
 
 # ── Translation strategy ───────────────────────────────────────────────────────
 
@@ -220,11 +269,13 @@ def print_usage():
     print(f"  --model <name>     Ollama model to use (e.g. qwen3:8b). If omitted you will be prompted.")
     print(f"  --scope <key>      Only translate strings under this key (e.g. pages or pages.home)")
     print(f"  --chunk-size <n>   Strings per API call (default: {CHUNK_SIZE}). Lower = more accurate.")
+    print(f"  --missing-only     Only translate keys absent or empty in the output file.")
     print()
     print(f"{BOLD}Examples:{RESET}")
     print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German --out de.json")
     print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang Spanish --out es.json --model qwen3:8b")
     print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang French  --out fr.json --scope pages.home")
+    print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --missing-only")
 
 def progress_bar(done: int, total: int, width: int = 36) -> str:
     pct   = done / total if total else 0
@@ -253,6 +304,7 @@ def main():
     model      = None
     scope      = None
     chunk_size = CHUNK_SIZE
+    missing_only = False
 
     i = 2
     while i < len(args):
@@ -265,6 +317,8 @@ def main():
             model = args[i + 1]; i += 2
         elif a == "--scope" and i + 1 < len(args):
             scope = args[i + 1]; i += 2
+        elif a == "--missing-only":
+            missing_only = True; i += 1
         elif a == "--chunk-size" and i + 1 < len(args):
             try:
                 chunk_size = int(args[i + 1])
@@ -329,6 +383,8 @@ def main():
     print(f"  {DIM}Chunk size:{RESET} {chunk_size} strings/call")
     if scope:
         print(f"  {DIM}Scope:{RESET}     {BOLD}{scope}{RESET}")
+    if missing_only:
+        print(f"  {DIM}Mode:{RESET}      {YELLOW}Missing keys only{RESET}")
     print()
 
     # ── Build entry list ───────────────────────────────────────────────────────
@@ -342,19 +398,42 @@ def main():
     else:
         entries = flatten_json(data)
 
-    total = len(entries)
-    if total == 0:
+    total_source = len(entries)
+    if total_source == 0:
         print(f"{YELLOW}No translatable strings found.{RESET}")
         sys.exit(0)
 
-    print(f"  Found {BOLD}{total}{RESET} translatable strings.\n")
-
     # ── Build output data (start as deep copy of source) ──────────────────────
-    out_data = deep_copy_structure(data)
+    # If the output file already exists, load it so we can merge into it.
+    if os.path.isfile(out_file):
+        with open(out_file, "r", encoding="utf-8") as f:
+            try:
+                out_data = json.load(f)
+            except json.JSONDecodeError:
+                print(f"{YELLOW}Warning: existing output file is invalid JSON — starting fresh.{RESET}")
+                out_data = deep_copy_structure(data)
+    else:
+        out_data = deep_copy_structure(data)
+
+    # ── Filter to missing/empty keys if requested ──────────────────────────────
+    if missing_only:
+        entries_before = len(entries)
+        entries = [(k, v) for k, v in entries if is_missing_or_empty(out_data, k)]
+        skipped_existing = entries_before - len(entries)
+        print(f"  Found {BOLD}{total_source}{RESET} source strings.")
+        if skipped_existing:
+            print(f"  {DIM}Skipping {skipped_existing} already-translated string(s).{RESET}")
+        if not entries:
+            print(f"\n  {GREEN}{BOLD}Nothing to translate — all keys already present in {out_file}{RESET}\n")
+            sys.exit(0)
+        print(f"  {YELLOW}{BOLD}{len(entries)} missing/empty string(s) to translate.{RESET}\n")
+    else:
+        print(f"  Found {BOLD}{total_source}{RESET} translatable strings.\n")
 
     # ── Translate in chunks ────────────────────────────────────────────────────
     errors   = 0
     done     = 0
+    total    = len(entries)
     chunks   = [entries[i:i + chunk_size] for i in range(0, total, chunk_size)]
 
     print(f"  Translating with {BOLD}{model}{RESET}...\n")

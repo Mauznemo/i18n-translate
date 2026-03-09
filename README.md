@@ -23,10 +23,12 @@ mv i18n-translate.py /usr/local/bin/i18n-translate
 i18n-translate en.json http://localhost:11434 --lang German --out de.json
 i18n-translate en.json http://localhost:11434 --lang Spanish --out es.json --model qwen3:8b
 i18n-translate en.json http://localhost:11434 --lang French --out fr.json --scope pages.home
+i18n-translate en.json http://localhost:11434 --lang German --out de.json --missing-only
 ```
 ### or
 ```sh
 python3 i18n-translate.py en.json http://localhost:11434 --lang German --out de.json
 python3 i18n-translate.py en.json http://localhost:11434 --lang Spanish --out es.json --model qwen3:8b
 python3 i18n-translate.py en.json http://localhost:11434 --lang French --out fr.json --scope pages.home
+python3 i18n-translate.py en.json http://localhost:11434 --lang German --out de.json --missing-only
 ```
