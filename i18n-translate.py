@@ -1,10 +1,11 @@
 #!/usr/bin/env python3
 """
-i18n JSON AI Translator v1.4
+i18n JSON AI Translator v1.5
 Translates all text values in nested i18n JSON files using a local Ollama instance.
 
 Usage:
   python3 i18n-translate.py <file> <ollama-url> --lang <language> --out <output-file> [options]
+  python3 i18n-translate.py <file> <ollama-url> --config <config-file> [options]
 
 Examples:
   python3 i18n-translate.py en.json http://localhost:11434 --lang German --out de.json
@@ -12,6 +13,8 @@ Examples:
   python3 i18n-translate.py en.json http://localhost:11434 --lang French --out fr.json --scope pages.home
   python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --missing-only
   python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --no-think
+  python3 i18n-translate.py en.json http://localhost:11434 --config languages.yaml
+  python3 i18n-translate.py en.json http://localhost:11434 --config languages.json --missing-only
 """
 
 import sys
@@ -23,7 +26,7 @@ import urllib.parse
 import urllib.error
 from typing import Optional
 
-VERSION = "1.4"
+VERSION = "1.5"
 
 # ANSI colors
 RED    = "\033[91m"
@@ -163,6 +166,151 @@ def is_missing_or_empty(data, key_path: str) -> bool:
         return True
     return False
 
+# ── Config file loading ────────────────────────────────────────────────────────
+
+def load_config(config_path: str) -> "list[dict]":
+    """
+    Load a YAML or JSON config file describing multiple target languages.
+
+    Expected format (YAML):
+      languages:
+        - lang: German
+          out: de.json
+        - lang: "German (Du Form)"
+          out: de-informal.json
+        - lang: Spanish
+          out: es.json
+          scope: pages.home   # optional per-language scope override
+
+    Expected format (JSON):
+      {
+        "languages": [
+          { "lang": "German", "out": "de.json" },
+          { "lang": "Spanish", "out": "es.json", "scope": "pages.home" }
+        ]
+      }
+
+    Returns a list of dicts, each with at minimum "lang" and "out" keys.
+    Optional keys per entry: "scope".
+    """
+    if not os.path.isfile(config_path):
+        print(f"{RED}Config file not found:{RESET} {config_path}")
+        sys.exit(1)
+
+    ext = os.path.splitext(config_path)[1].lower()
+
+    # ── JSON config ────────────────────────────────────────────────────────────
+    if ext == ".json":
+        with open(config_path, "r", encoding="utf-8") as f:
+            try:
+                raw = json.load(f)
+            except json.JSONDecodeError as e:
+                print(f"{RED}Invalid JSON in config file:{RESET} {e}")
+                sys.exit(1)
+        entries = raw.get("languages") if isinstance(raw, dict) else raw
+        if not isinstance(entries, list):
+            print(f"{RED}Config JSON must have a top-level 'languages' array.{RESET}")
+            sys.exit(1)
+        return _validate_config_entries(entries, config_path)
+
+    # ── YAML config (stdlib-only, no PyYAML required) ──────────────────────────
+    if ext in (".yaml", ".yml"):
+        return _load_yaml_config(config_path)
+
+    print(f"{RED}Unsupported config format '{ext}'. Use .json, .yaml, or .yml{RESET}")
+    sys.exit(1)
+
+
+def _validate_config_entries(entries: list, source: str) -> "list[dict]":
+    valid = []
+    for i, entry in enumerate(entries):
+        if not isinstance(entry, dict):
+            print(f"{YELLOW}Warning: config entry #{i + 1} is not an object — skipping.{RESET}")
+            continue
+        if "lang" not in entry or "out" not in entry:
+            print(f"{YELLOW}Warning: config entry #{i + 1} missing 'lang' or 'out' — skipping.{RESET}")
+            continue
+        valid.append(entry)
+    if not valid:
+        print(f"{RED}No valid language entries found in config file: {source}{RESET}")
+        sys.exit(1)
+    return valid
+
+
+def _load_yaml_config(config_path: str) -> "list[dict]":
+    """
+    Minimal YAML parser sufficient for the config format — no external deps.
+    Supports only the simple flat structure this tool needs:
+
+      languages:
+        - lang: German
+          out: de.json
+        - lang: Spanish
+          out: es.json
+          scope: pages.home
+
+    Quoted strings (single or double) are supported.
+    Inline comments (#) are stripped.
+    """
+    with open(config_path, "r", encoding="utf-8") as f:
+        lines = f.readlines()
+
+    entries = []
+    current: Optional[dict] = None
+    in_languages = False
+
+    for raw_line in lines:
+        # Strip inline comments and trailing whitespace
+        line = re.sub(r'\s+#.*$', '', raw_line.rstrip())
+        stripped = line.lstrip()
+
+        if not stripped:
+            continue
+
+        # Detect "languages:" section header
+        if re.match(r'^languages\s*:', line):
+            in_languages = True
+            continue
+
+        if not in_languages:
+            continue
+
+        # New list item
+        if re.match(r'^\s+-\s+', line):
+            if current is not None:
+                entries.append(current)
+            current = {}
+            # The first key may appear on the same line as the dash
+            rest = re.sub(r'^\s+-\s+', '', line)
+            _yaml_parse_kv(rest, current)
+            continue
+
+        # Continuation key on its own line (indented, no dash)
+        if current is not None and re.match(r'^\s+\S', line):
+            _yaml_parse_kv(stripped, current)
+            continue
+
+        # Top-level key outside a list item — ignore (e.g. another section)
+
+    if current is not None:
+        entries.append(current)
+
+    return _validate_config_entries(entries, config_path)
+
+
+def _yaml_parse_kv(text: str, target: dict) -> None:
+    """Parse a single 'key: value' line into target dict."""
+    m = re.match(r'^([\w-]+)\s*:\s*(.*)', text.strip())
+    if not m:
+        return
+    key = m.group(1)
+    value = m.group(2).strip()
+    # Strip surrounding quotes
+    if (value.startswith('"') and value.endswith('"')) or \
+       (value.startswith("'") and value.endswith("'")):
+        value = value[1:-1]
+    target[key] = value
+
 # ── Translation strategy ───────────────────────────────────────────────────────
 
 # The /no_think prefix is the standard Ollama convention for disabling chain-of-thought
@@ -212,22 +360,10 @@ GLOSSARY_MAX_ENTRIES = 50
 def update_glossary(glossary: dict,
                     source_chunk: "list[tuple[str, str]]",
                     translated_map: dict) -> None:
-    """
-    After a chunk is translated, add short source→translation pairs to the
-    running glossary so future chunks stay consistent.
-
-    Only short values (≤ GLOSSARY_MAX_WORDS words, no placeholders, no HTML)
-    are added — these are the UI terms most prone to inconsistent rendering
-    across chunks (e.g. "Submit", "Cancel", "Save changes").
-
-    The glossary is capped at GLOSSARY_MAX_ENTRIES; oldest entries are evicted
-    first when the cap is reached.
-    """
     for key, source_value in source_chunk:
         translated_value = translated_map.get(key)
         if not translated_value or not isinstance(translated_value, str):
             continue
-        # Skip strings with placeholders or HTML tags — they're context-specific.
         if re.search(r'\{[\w:]+\}|%[sd]|%\(\w+\)s|<[a-zA-Z/]', source_value):
             continue
         word_count = len(source_value.split())
@@ -236,7 +372,6 @@ def update_glossary(glossary: dict,
         src = source_value.strip()
         tgt = translated_value.strip()
         if src and tgt and src != tgt:
-            # Evict oldest entry if at cap (dicts preserve insertion order in Python 3.7+)
             if src not in glossary and len(glossary) >= GLOSSARY_MAX_ENTRIES:
                 oldest = next(iter(glossary))
                 del glossary[oldest]
@@ -246,15 +381,6 @@ def update_glossary(glossary: dict,
 def seed_glossary_from_existing(glossary: dict,
                                 source_data,
                                 existing_data) -> int:
-    """
-    Pre-populate the glossary from translations that already exist in the
-    output file.  For every string in source_data that has a corresponding
-    non-empty translation in existing_data, we treat the pair as a confirmed
-    source→translation term and add it to the glossary (subject to the same
-    word-count and placeholder filters used by update_glossary).
-
-    Returns the number of entries seeded.
-    """
     source_entries = flatten_json(source_data)
     seeded = 0
     for key, source_value in source_entries:
@@ -263,7 +389,6 @@ def seed_glossary_from_existing(glossary: dict,
         translated_value = get_nested_value(existing_data, key)
         if not translated_value or not isinstance(translated_value, str):
             continue
-        # Apply the same filters as update_glossary
         if re.search(r'\{[\w:]+\}|%[sd]|%\(\w+\)s|<[a-zA-Z/]', source_value):
             continue
         if len(source_value.split()) > GLOSSARY_MAX_WORDS:
@@ -282,13 +407,7 @@ def seed_glossary_from_existing(glossary: dict,
 def translate_chunk(entries: "list[tuple[str, str]]", target_language: str,
                     base_url: str, model: str, no_think: bool = False,
                     glossary: Optional[dict] = None) -> dict:
-    """
-    Translate a list of (key, value) pairs in one API call.
-    Returns a dict mapping key -> translated value.
-    """
     system = build_system_prompt(target_language, no_think, glossary)
-
-    # Build a compact JSON object: { key: value, ... }
     payload = {k: v for k, v in entries}
     user_prompt = (
         f"Translate the following JSON values to {target_language}. "
@@ -297,12 +416,8 @@ def translate_chunk(entries: "list[tuple[str, str]]", target_language: str,
     )
 
     raw = ollama_chat(base_url, model, system, user_prompt, no_think)
-
-    # Strip accidental markdown fences
     raw = re.sub(r'^```[a-z]*\n?', '', raw.strip())
     raw = re.sub(r'\n?```$', '', raw.strip())
-
-    # Strip any residual <think>…</think> block that leaked into the content
     raw = re.sub(r'<think>.*?</think>\s*', '', raw, flags=re.DOTALL).strip()
 
     try:
@@ -319,7 +434,6 @@ def translate_chunk(entries: "list[tuple[str, str]]", target_language: str,
 def translate_chunk_fallback(entries: "list[tuple[str, str]]", target_language: str,
                               base_url: str, model: str, no_think: bool = False,
                               glossary: Optional[dict] = None) -> dict:
-    """Translate each string individually as a fallback."""
     system = build_system_prompt(target_language, no_think, glossary)
     result = {}
     for key, value in entries:
@@ -328,7 +442,6 @@ def translate_chunk_fallback(entries: "list[tuple[str, str]]", target_language: 
             f"Output ONLY the translated string, nothing else.\n\n{value}"
         )
         translated = ollama_chat(base_url, model, system, user_prompt, no_think)
-        # Strip any residual <think>…</think> block that leaked into the content
         translated = re.sub(r'<think>.*?</think>\s*', '', translated, flags=re.DOTALL).strip()
         result[key] = translated
     return result
@@ -361,28 +474,54 @@ def print_header():
 def print_usage():
     print(f"{BOLD}Usage:{RESET}")
     print(f"  python3 i18n-translate.py <file> <ollama-url> --lang <language> --out <output-file> [options]")
+    print(f"  python3 i18n-translate.py <file> <ollama-url> --config <config-file> [options]")
     print()
     print(f"{BOLD}Required arguments:{RESET}")
     print(f"  file               Path to your source i18n JSON file (e.g. en.json)")
     print(f"  ollama-url         URL of your Ollama server  (e.g. http://localhost:11434)")
+    print()
+    print(f"{BOLD}Single-language mode (mutually exclusive with --config):{RESET}")
     print(f"  --lang <language>  Target language name       (e.g. German, Spanish, French)")
     print(f"  --out  <file>      Output file path           (e.g. de.json)")
     print()
-    print(f"{BOLD}Optional:{RESET}")
+    print(f"{BOLD}Batch mode:{RESET}")
+    print(f"  --config <file>    Path to a YAML or JSON config file listing all target languages.")
+    print(f"                     See 'Config file format' below.")
+    print()
+    print(f"{BOLD}Optional (apply to both modes):{RESET}")
     print(f"  --model <name>     Ollama model to use (e.g. qwen3:8b). If omitted you will be prompted.")
-    print(f"  --scope <key>      Only translate strings under this key (e.g. pages or pages.home)")
+    print(f"  --scope <key>      Only translate strings under this key (e.g. pages or pages.home).")
+    print(f"                     Per-language scope in the config overrides this.")
     print(f"  --chunk-size <n>   Strings per API call (default: {CHUNK_SIZE}). Lower = more accurate.")
     print(f"  --missing-only     Only translate keys absent or empty in the output file.")
     print(f"  --no-think         Disable chain-of-thought reasoning (faster; for models like qwen3,")
     print(f"                     deepseek-r1). Passes think:false to Ollama and prepends /no_think")
     print(f"                     to the system prompt. Safe to use with non-reasoning models.")
     print()
+    print(f"{BOLD}Config file format:{RESET}")
+    print(f"  YAML (languages.yaml):")
+    print(f"    languages:")
+    print(f"      - lang: German")
+    print(f"        out: de.json")
+    print(f'      - lang: "German (Du Form)"')
+    print(f"        out: de-informal.json")
+    print(f"      - lang: Spanish")
+    print(f"        out: es.json")
+    print(f"        scope: pages.home   # optional, overrides --scope for this language")
+    print()
+    print(f"  JSON (languages.json):")
+    print(f'    {{"languages": [')
+    print(f'      {{"lang": "German",  "out": "de.json"}},')
+    print(f'      {{"lang": "Spanish", "out": "es.json", "scope": "pages.home"}}')
+    print(f"    ]}}")
+    print()
     print(f"{BOLD}Examples:{RESET}")
     print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German --out de.json")
     print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang Spanish --out es.json --model qwen3:8b")
     print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang French  --out fr.json --scope pages.home")
-    print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --missing-only")
-    print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --model qwen3:8b --no-think")
+    print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --missing-only --no-think")
+    print(f"  python3 i18n-translate.py en.json http://localhost:11434 --config languages.yaml")
+    print(f"  python3 i18n-translate.py en.json http://localhost:11434 --config languages.yaml --missing-only --model qwen3:8b")
 
 def progress_bar(done: int, total: int, width: int = 36) -> str:
     pct   = done / total if total else 0
@@ -390,144 +529,53 @@ def progress_bar(done: int, total: int, width: int = 36) -> str:
     bar   = "█" * filled + "░" * (width - filled)
     return f"[{bar}] {done}/{total} ({pct:.0%})"
 
-# ── Main ───────────────────────────────────────────────────────────────────────
+# ── Core translation runner ────────────────────────────────────────────────────
 
-def main():
-    args = sys.argv[1:]
-
-    if not args or args[0] in ("-h", "--help"):
-        print_header()
-        print_usage()
-        sys.exit(0 if args else 1)
-
-    if len(args) < 2:
-        print_usage()
-        sys.exit(1)
-
-    filepath   = args[0]
-    base_url   = args[1].rstrip("/")
-    lang       = None
-    out_file   = None
-    model      = None
-    scope      = None
-    chunk_size = CHUNK_SIZE
-    missing_only = False
-    no_think     = False
-
-    i = 2
-    while i < len(args):
-        a = args[i]
-        if a == "--lang" and i + 1 < len(args):
-            lang = args[i + 1]; i += 2
-        elif a == "--out" and i + 1 < len(args):
-            out_file = args[i + 1]; i += 2
-        elif a == "--model" and i + 1 < len(args):
-            model = args[i + 1]; i += 2
-        elif a == "--scope" and i + 1 < len(args):
-            scope = args[i + 1]; i += 2
-        elif a == "--missing-only":
-            missing_only = True; i += 1
-        elif a == "--no-think":
-            no_think = True; i += 1
-        elif a == "--chunk-size" and i + 1 < len(args):
-            try:
-                chunk_size = int(args[i + 1])
-            except ValueError:
-                print(f"{RED}--chunk-size must be an integer{RESET}")
-                sys.exit(1)
-            i += 2
-        else:
-            print(f"{RED}Unknown argument:{RESET} {a}")
-            print_usage()
-            sys.exit(1)
-
-    # Validate required args
-    missing = []
-    if not lang:     missing.append("--lang")
-    if not out_file: missing.append("--out")
-    if missing:
-        print(f"{RED}Missing required argument(s):{RESET} {', '.join(missing)}")
-        print_usage()
-        sys.exit(1)
-
-    if not os.path.isfile(filepath):
-        print(f"{RED}File not found:{RESET} {filepath}")
-        sys.exit(1)
-
-    print_header()
-
-    # ── Load JSON ──────────────────────────────────────────────────────────────
-    with open(filepath, "r", encoding="utf-8") as f:
-        try:
-            data = json.load(f)
-        except json.JSONDecodeError as e:
-            print(f"{RED}Invalid JSON:{RESET} {e}")
-            sys.exit(1)
-
-    # ── Pick model ─────────────────────────────────────────────────────────────
-    models = ollama_list_models(base_url)
-    if not models:
-        print(f"{RED}No models found on Ollama server at {base_url}{RESET}")
-        sys.exit(1)
-
-    if model:
-        # Validate the passed model exists (fuzzy: prefix match)
-        matched = next((m for m in models if m == model or m.startswith(model)), None)
-        if not matched:
-            print(f"{YELLOW}Warning: model '{model}' not found. Available:{RESET}")
-            for m in models:
-                print(f"  - {m}")
-            print()
-            model = pick_model(models)
-        else:
-            model = matched
-    else:
-        model = pick_model(models)
-
-    # ── Print config ───────────────────────────────────────────────────────────
-    print(f"\n  {DIM}Source:{RESET}    {filepath}")
-    print(f"  {DIM}Output:{RESET}    {out_file}")
-    print(f"  {DIM}Language:{RESET}  {lang}")
-    print(f"  {DIM}Model:{RESET}     {model}")
-    print(f"  {DIM}Server:{RESET}    {base_url}")
-    print(f"  {DIM}Chunk size:{RESET} {chunk_size} strings/call")
-    if scope:
-        print(f"  {DIM}Scope:{RESET}     {BOLD}{scope}{RESET}")
-    if missing_only:
-        print(f"  {DIM}Mode:{RESET}      {YELLOW}Missing keys only{RESET}")
-    if no_think:
-        print(f"  {DIM}Reasoning:{RESET} {YELLOW}Disabled (--no-think){RESET}")
-    print()
-
+def run_translation(
+    filepath: str,
+    base_url: str,
+    lang: str,
+    out_file: str,
+    model: str,
+    scope: Optional[str],
+    chunk_size: int,
+    missing_only: bool,
+    no_think: bool,
+    source_data: dict,
+    label: Optional[str] = None,
+) -> bool:
+    """
+    Translate source_data into `lang` and write result to `out_file`.
+    Returns True on success, False if nothing was translated.
+    """
     # ── Build entry list ───────────────────────────────────────────────────────
     if scope:
         try:
-            scoped_data = get_scoped_data(data, scope)
+            scoped_data = get_scoped_data(source_data, scope)
         except KeyError as e:
-            print(f"{RED}Error:{RESET} {e}")
-            sys.exit(1)
+            print(f"  {RED}Error:{RESET} {e}")
+            return False
         entries = flatten_json(scoped_data, prefix=scope)
     else:
-        entries = flatten_json(data)
+        entries = flatten_json(source_data)
 
     total_source = len(entries)
     if total_source == 0:
-        print(f"{YELLOW}No translatable strings found.{RESET}")
-        sys.exit(0)
+        print(f"  {YELLOW}No translatable strings found.{RESET}")
+        return False
 
-    # ── Build output data (start as deep copy of source) ──────────────────────
-    # If the output file already exists, load it so we can merge into it.
+    # ── Build output data ──────────────────────────────────────────────────────
     if os.path.isfile(out_file):
         with open(out_file, "r", encoding="utf-8") as f:
             try:
                 out_data = json.load(f)
             except json.JSONDecodeError:
-                print(f"{YELLOW}Warning: existing output file is invalid JSON — starting fresh.{RESET}")
-                out_data = deep_copy_structure(data)
+                print(f"  {YELLOW}Warning: existing output file is invalid JSON — starting fresh.{RESET}")
+                out_data = deep_copy_structure(source_data)
     else:
-        out_data = deep_copy_structure(data)
+        out_data = deep_copy_structure(source_data)
 
-    # ── Filter to missing/empty keys if requested ──────────────────────────────
+    # ── Filter missing keys ────────────────────────────────────────────────────
     if missing_only:
         entries_before = len(entries)
         entries = [(k, v) for k, v in entries if is_missing_or_empty(out_data, k)]
@@ -536,8 +584,8 @@ def main():
         if skipped_existing:
             print(f"  {DIM}Skipping {skipped_existing} already-translated string(s).{RESET}")
         if not entries:
-            print(f"\n  {GREEN}{BOLD}Nothing to translate — all keys already present in {out_file}{RESET}\n")
-            sys.exit(0)
+            print(f"  {GREEN}{BOLD}Nothing to translate — all keys already present in {out_file}{RESET}")
+            return True
         print(f"  {YELLOW}{BOLD}{len(entries)} missing/empty string(s) to translate.{RESET}\n")
     else:
         print(f"  Found {BOLD}{total_source}{RESET} translatable strings.\n")
@@ -548,18 +596,14 @@ def main():
     total    = len(entries)
     chunks   = [entries[i:i + chunk_size] for i in range(0, total, chunk_size)]
 
-    # Running glossary: pre-seeded from any translations already present in the
-    # output file so --missing-only runs stay consistent with prior work,
-    # then grown chunk-by-chunk during this run.
-    glossary = {}  # type: dict
-    seeded = seed_glossary_from_existing(glossary, data, out_data)
+    glossary: dict = {}
+    seeded = seed_glossary_from_existing(glossary, source_data, out_data)
     if seeded:
         print(f"  {DIM}Glossary pre-seeded with {seeded} term(s) from existing translations.{RESET}\n")
 
     print(f"  Translating with {BOLD}{model}{RESET}...\n")
 
     for chunk_idx, chunk in enumerate(chunks):
-        # Show progress
         print(f"\r\033[K  {progress_bar(done, total)}  chunk {chunk_idx + 1}/{len(chunks)}", end="", flush=True)
 
         try:
@@ -575,25 +619,16 @@ def main():
 
         for key, original_value in chunk:
             translated_value = translated_map.get(key)
-
             if translated_value is None:
-                # Key might be present without scope prefix in response
                 short_key = key.split(".")[-1]
                 translated_value = translated_map.get(short_key)
-
             if translated_value and isinstance(translated_value, str):
                 set_nested_value(out_data, key, translated_value)
             else:
-                # Keep original if translation missing
                 errors += 1
-
             done += 1
 
-        # Update the glossary with short terms from this chunk so the next
-        # chunk can reuse them for consistency.
         update_glossary(glossary, chunk, translated_map)
-
-        # Refresh progress after chunk
         print(f"\r\033[K  {progress_bar(done, total)}  chunk {chunk_idx + 1}/{len(chunks)}", end="", flush=True)
 
     print(f"\r\033[K  {progress_bar(total, total)}  Done!                        ")
@@ -622,6 +657,194 @@ def main():
         if seeded and grown:
             print(f"  {DIM}Glossary: {seeded} pre-seeded + {grown} new = {total_terms} terms{RESET}")
     print(f"\n  {GREEN}{BOLD}Output saved to {out_file}{RESET}\n")
+    return True
+
+# ── Main ───────────────────────────────────────────────────────────────────────
+
+def main():
+    args = sys.argv[1:]
+
+    if not args or args[0] in ("-h", "--help"):
+        print_header()
+        print_usage()
+        sys.exit(0 if args else 1)
+
+    if len(args) < 2:
+        print_usage()
+        sys.exit(1)
+
+    filepath   = args[0]
+    base_url   = args[1].rstrip("/")
+    lang       = None
+    out_file   = None
+    model      = None
+    scope      = None
+    config     = None
+    chunk_size = CHUNK_SIZE
+    missing_only = False
+    no_think     = False
+
+    i = 2
+    while i < len(args):
+        a = args[i]
+        if a == "--lang" and i + 1 < len(args):
+            lang = args[i + 1]; i += 2
+        elif a == "--out" and i + 1 < len(args):
+            out_file = args[i + 1]; i += 2
+        elif a == "--model" and i + 1 < len(args):
+            model = args[i + 1]; i += 2
+        elif a == "--scope" and i + 1 < len(args):
+            scope = args[i + 1]; i += 2
+        elif a == "--config" and i + 1 < len(args):
+            config = args[i + 1]; i += 2
+        elif a == "--missing-only":
+            missing_only = True; i += 1
+        elif a == "--no-think":
+            no_think = True; i += 1
+        elif a == "--chunk-size" and i + 1 < len(args):
+            try:
+                chunk_size = int(args[i + 1])
+            except ValueError:
+                print(f"{RED}--chunk-size must be an integer{RESET}")
+                sys.exit(1)
+            i += 2
+        else:
+            print(f"{RED}Unknown argument:{RESET} {a}")
+            print_usage()
+            sys.exit(1)
+
+    # ── Validate mode ──────────────────────────────────────────────────────────
+    if config and (lang or out_file):
+        print(f"{RED}--config cannot be combined with --lang or --out.{RESET}")
+        print(f"{DIM}Use --scope, --missing-only, --no-think, --model, --chunk-size with --config.{RESET}")
+        sys.exit(1)
+
+    if not config:
+        missing = []
+        if not lang:     missing.append("--lang")
+        if not out_file: missing.append("--out")
+        if missing:
+            print(f"{RED}Missing required argument(s):{RESET} {', '.join(missing)}")
+            print(f"{DIM}Tip: use --config <file> to translate multiple languages at once.{RESET}")
+            print_usage()
+            sys.exit(1)
+
+    if not os.path.isfile(filepath):
+        print(f"{RED}File not found:{RESET} {filepath}")
+        sys.exit(1)
+
+    print_header()
+
+    # ── Load source JSON ───────────────────────────────────────────────────────
+    with open(filepath, "r", encoding="utf-8") as f:
+        try:
+            source_data = json.load(f)
+        except json.JSONDecodeError as e:
+            print(f"{RED}Invalid JSON:{RESET} {e}")
+            sys.exit(1)
+
+    # ── Pick model ─────────────────────────────────────────────────────────────
+    models = ollama_list_models(base_url)
+    if not models:
+        print(f"{RED}No models found on Ollama server at {base_url}{RESET}")
+        sys.exit(1)
+
+    if model:
+        matched = next((m for m in models if m == model or m.startswith(model)), None)
+        if not matched:
+            print(f"{YELLOW}Warning: model '{model}' not found. Available:{RESET}")
+            for m in models:
+                print(f"  - {m}")
+            print()
+            model = pick_model(models)
+        else:
+            model = matched
+    else:
+        model = pick_model(models)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # BATCH MODE
+    # ══════════════════════════════════════════════════════════════════════════
+    if config:
+        language_entries = load_config(config)
+        total_langs = len(language_entries)
+
+        print(f"  {DIM}Source:{RESET}    {filepath}")
+        print(f"  {DIM}Config:{RESET}    {config}")
+        print(f"  {DIM}Model:{RESET}     {model}")
+        print(f"  {DIM}Server:{RESET}    {base_url}")
+        print(f"  {DIM}Chunk size:{RESET} {chunk_size} strings/call")
+        if scope:
+            print(f"  {DIM}Scope:{RESET}     {BOLD}{scope}{RESET} {DIM}(global default){RESET}")
+        if missing_only:
+            print(f"  {DIM}Mode:{RESET}      {YELLOW}Missing keys only{RESET}")
+        if no_think:
+            print(f"  {DIM}Reasoning:{RESET} {YELLOW}Disabled (--no-think){RESET}")
+        print(f"\n  {BOLD}Batch:{RESET} {total_langs} language(s) to process\n")
+        print(f"  {'─' * 62}")
+
+        success_count = 0
+        for idx, entry in enumerate(language_entries, 1):
+            entry_lang  = entry["lang"]
+            entry_out   = entry["out"]
+            # Per-language scope overrides the global --scope
+            entry_scope = entry.get("scope") or scope
+
+            print(f"\n  {BOLD}{CYAN}[{idx}/{total_langs}] {entry_lang}{RESET}  →  {entry_out}")
+            if entry_scope:
+                print(f"  {DIM}Scope: {entry_scope}{RESET}")
+            print()
+
+            ok = run_translation(
+                filepath=filepath,
+                base_url=base_url,
+                lang=entry_lang,
+                out_file=entry_out,
+                model=model,
+                scope=entry_scope,
+                chunk_size=chunk_size,
+                missing_only=missing_only,
+                no_think=no_think,
+                source_data=source_data,
+                label=f"{idx}/{total_langs}",
+            )
+            if ok:
+                success_count += 1
+
+        # ── Batch summary ──────────────────────────────────────────────────────
+        print(f"  {'═' * 62}")
+        print(f"  {BOLD}Batch complete:{RESET} {GREEN}{success_count}/{total_langs} language(s) processed{RESET}\n")
+        sys.exit(0)
+
+    # ══════════════════════════════════════════════════════════════════════════
+    # SINGLE-LANGUAGE MODE
+    # ══════════════════════════════════════════════════════════════════════════
+    print(f"\n  {DIM}Source:{RESET}    {filepath}")
+    print(f"  {DIM}Output:{RESET}    {out_file}")
+    print(f"  {DIM}Language:{RESET}  {lang}")
+    print(f"  {DIM}Model:{RESET}     {model}")
+    print(f"  {DIM}Server:{RESET}    {base_url}")
+    print(f"  {DIM}Chunk size:{RESET} {chunk_size} strings/call")
+    if scope:
+        print(f"  {DIM}Scope:{RESET}     {BOLD}{scope}{RESET}")
+    if missing_only:
+        print(f"  {DIM}Mode:{RESET}      {YELLOW}Missing keys only{RESET}")
+    if no_think:
+        print(f"  {DIM}Reasoning:{RESET} {YELLOW}Disabled (--no-think){RESET}")
+    print()
+
+    run_translation(
+        filepath=filepath,
+        base_url=base_url,
+        lang=lang,
+        out_file=out_file,
+        model=model,
+        scope=scope,
+        chunk_size=chunk_size,
+        missing_only=missing_only,
+        no_think=no_think,
+        source_data=source_data,
+    )
 
 
 if __name__ == "__main__":
