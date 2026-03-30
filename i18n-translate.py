@@ -1,6 +1,6 @@
 #!/usr/bin/env python3
 """
-i18n JSON AI Translator v1.1
+i18n JSON AI Translator v1.4
 Translates all text values in nested i18n JSON files using a local Ollama instance.
 
 Usage:
@@ -10,8 +10,8 @@ Examples:
   python3 i18n-translate.py en.json http://localhost:11434 --lang German --out de.json
   python3 i18n-translate.py en.json http://localhost:11434 --lang Spanish --out es.json --model qwen3:8b
   python3 i18n-translate.py en.json http://localhost:11434 --lang French --out fr.json --scope pages.home
-    print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --missing-only")
-  python3 i18n-translate.py en.json http://localhost:11434 --lang German --out de.json --missing-only
+  python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --missing-only
+  python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --no-think
 """
 
 import sys
@@ -21,8 +21,9 @@ import os
 import urllib.request
 import urllib.parse
 import urllib.error
+from typing import Optional
 
-VERSION = "1.1"
+VERSION = "1.4"
 
 # ANSI colors
 RED    = "\033[91m"
@@ -35,7 +36,7 @@ RESET  = "\033[0m"
 
 # ── Ollama API ─────────────────────────────────────────────────────────────────
 
-def ollama_list_models(base_url: str) -> list[str]:
+def ollama_list_models(base_url: str) -> "list[str]":
     req = urllib.request.Request(f"{base_url}/api/tags")
     try:
         with urllib.request.urlopen(req, timeout=10) as resp:
@@ -46,7 +47,7 @@ def ollama_list_models(base_url: str) -> list[str]:
         print(f"{DIM}Make sure Ollama is running at {base_url}{RESET}")
         sys.exit(1)
 
-def ollama_chat(base_url: str, model: str, system: str, user: str) -> str:
+def ollama_chat(base_url: str, model: str, system: str, user: str, no_think: bool = False) -> str:
     payload = json.dumps({
         "model": model,
         "stream": False,
@@ -56,7 +57,10 @@ def ollama_chat(base_url: str, model: str, system: str, user: str) -> str:
         ],
         "options": {
             "temperature": 0.1,  # Low temp for consistent, accurate translation
-        }
+        },
+        # Some Ollama backends honour a top-level "think" flag directly.
+        # Setting it to False is a no-op on models that don't support it.
+        **({"think": False} if no_think else {}),
     }).encode("utf-8")
     req = urllib.request.Request(
         f"{base_url}/api/chat",
@@ -161,11 +165,17 @@ def is_missing_or_empty(data, key_path: str) -> bool:
 
 # ── Translation strategy ───────────────────────────────────────────────────────
 
+# The /no_think prefix is the standard Ollama convention for disabling chain-of-thought
+# reasoning on models that support it (e.g. qwen3, deepseek-r1). It is prepended to the
+# system prompt when --no-think is passed. On models that don't support it the prefix is
+# harmless and is simply ignored.
+NO_THINK_PREFIX = "/no_think\n"
+
 SYSTEM_PROMPT = """\
 You are a professional i18n (internationalisation) translator. Your job is to translate UI strings from a software application.
 
 Rules you MUST follow:
-1. Preserve ALL placeholders exactly as-is. Placeholders look like: {name}, {count}, {date}, {{escaped}}, %s, %d, %(key)s.
+1. Preserve ALL placeholders exactly as-is. Placeholders look like: {name}, {count}, $date, {{escaped}}, %s, %d, %(key)s.
 2. Preserve ALL HTML tags exactly as-is (e.g. <strong>, <br/>, <a href="...">, etc.).
 3. Preserve ALL special characters, punctuation style, and capitalisation conventions of the original.
 4. Keep the same tone: if the original is formal, stay formal; if casual, stay casual.
@@ -175,21 +185,108 @@ Rules you MUST follow:
 8. Translate to {target_language}.
 """
 
-def build_system_prompt(target_language: str) -> str:
-    return SYSTEM_PROMPT.replace("{target_language}", target_language)
+def build_system_prompt(target_language: str, no_think: bool = False,
+                        glossary: Optional[dict] = None) -> str:
+    prompt = SYSTEM_PROMPT.replace("{target_language}", target_language)
+    if glossary:
+        lines = "\n".join(f"  {src} → {tgt}" for src, tgt in glossary.items())
+        prompt += (
+            f"\nConsistency glossary — you MUST use these established translations exactly:\n"
+            f"{lines}\n"
+        )
+    if no_think:
+        prompt = NO_THINK_PREFIX + prompt
+    return prompt
 
 
 # Chunk size: number of key-value pairs per API call.
 # Smaller = more accurate but slower. Larger = faster but may lose context.
 CHUNK_SIZE = 20
 
-def translate_chunk(entries: list[tuple[str, str]], target_language: str,
-                    base_url: str, model: str) -> dict[str, str]:
+# Glossary: only track short UI terms (≤ this many words) to keep the prompt tight.
+GLOSSARY_MAX_WORDS = 5
+# Cap total glossary entries injected into each prompt.
+GLOSSARY_MAX_ENTRIES = 50
+
+
+def update_glossary(glossary: dict,
+                    source_chunk: "list[tuple[str, str]]",
+                    translated_map: dict) -> None:
+    """
+    After a chunk is translated, add short source→translation pairs to the
+    running glossary so future chunks stay consistent.
+
+    Only short values (≤ GLOSSARY_MAX_WORDS words, no placeholders, no HTML)
+    are added — these are the UI terms most prone to inconsistent rendering
+    across chunks (e.g. "Submit", "Cancel", "Save changes").
+
+    The glossary is capped at GLOSSARY_MAX_ENTRIES; oldest entries are evicted
+    first when the cap is reached.
+    """
+    for key, source_value in source_chunk:
+        translated_value = translated_map.get(key)
+        if not translated_value or not isinstance(translated_value, str):
+            continue
+        # Skip strings with placeholders or HTML tags — they're context-specific.
+        if re.search(r'\{[\w:]+\}|%[sd]|%\(\w+\)s|<[a-zA-Z/]', source_value):
+            continue
+        word_count = len(source_value.split())
+        if word_count > GLOSSARY_MAX_WORDS:
+            continue
+        src = source_value.strip()
+        tgt = translated_value.strip()
+        if src and tgt and src != tgt:
+            # Evict oldest entry if at cap (dicts preserve insertion order in Python 3.7+)
+            if src not in glossary and len(glossary) >= GLOSSARY_MAX_ENTRIES:
+                oldest = next(iter(glossary))
+                del glossary[oldest]
+            glossary[src] = tgt
+
+
+def seed_glossary_from_existing(glossary: dict,
+                                source_data,
+                                existing_data) -> int:
+    """
+    Pre-populate the glossary from translations that already exist in the
+    output file.  For every string in source_data that has a corresponding
+    non-empty translation in existing_data, we treat the pair as a confirmed
+    source→translation term and add it to the glossary (subject to the same
+    word-count and placeholder filters used by update_glossary).
+
+    Returns the number of entries seeded.
+    """
+    source_entries = flatten_json(source_data)
+    seeded = 0
+    for key, source_value in source_entries:
+        if is_missing_or_empty(existing_data, key):
+            continue
+        translated_value = get_nested_value(existing_data, key)
+        if not translated_value or not isinstance(translated_value, str):
+            continue
+        # Apply the same filters as update_glossary
+        if re.search(r'\{[\w:]+\}|%[sd]|%\(\w+\)s|<[a-zA-Z/]', source_value):
+            continue
+        if len(source_value.split()) > GLOSSARY_MAX_WORDS:
+            continue
+        src = source_value.strip()
+        tgt = translated_value.strip()
+        if src and tgt and src != tgt:
+            if src not in glossary and len(glossary) >= GLOSSARY_MAX_ENTRIES:
+                oldest = next(iter(glossary))
+                del glossary[oldest]
+            glossary[src] = tgt
+            seeded += 1
+    return seeded
+
+
+def translate_chunk(entries: "list[tuple[str, str]]", target_language: str,
+                    base_url: str, model: str, no_think: bool = False,
+                    glossary: Optional[dict] = None) -> dict:
     """
     Translate a list of (key, value) pairs in one API call.
     Returns a dict mapping key -> translated value.
     """
-    system = build_system_prompt(target_language)
+    system = build_system_prompt(target_language, no_think, glossary)
 
     # Build a compact JSON object: { key: value, ... }
     payload = {k: v for k, v in entries}
@@ -199,11 +296,14 @@ def translate_chunk(entries: list[tuple[str, str]], target_language: str,
         + json.dumps(payload, ensure_ascii=False, indent=2)
     )
 
-    raw = ollama_chat(base_url, model, system, user_prompt)
+    raw = ollama_chat(base_url, model, system, user_prompt, no_think)
 
     # Strip accidental markdown fences
     raw = re.sub(r'^```[a-z]*\n?', '', raw.strip())
     raw = re.sub(r'\n?```$', '', raw.strip())
+
+    # Strip any residual <think>…</think> block that leaked into the content
+    raw = re.sub(r'<think>.*?</think>\s*', '', raw, flags=re.DOTALL).strip()
 
     try:
         result = json.loads(raw)
@@ -213,26 +313,29 @@ def translate_chunk(entries: list[tuple[str, str]], target_language: str,
     except (json.JSONDecodeError, ValueError) as e:
         print(f"\n{YELLOW}Warning: Could not parse chunk response as JSON ({e}). "
               f"Falling back to string-by-string mode for this chunk.{RESET}")
-        return translate_chunk_fallback(entries, target_language, base_url, model)
+        return translate_chunk_fallback(entries, target_language, base_url, model, no_think, glossary)
 
 
-def translate_chunk_fallback(entries: list[tuple[str, str]], target_language: str,
-                              base_url: str, model: str) -> dict[str, str]:
+def translate_chunk_fallback(entries: "list[tuple[str, str]]", target_language: str,
+                              base_url: str, model: str, no_think: bool = False,
+                              glossary: Optional[dict] = None) -> dict:
     """Translate each string individually as a fallback."""
-    system = build_system_prompt(target_language)
+    system = build_system_prompt(target_language, no_think, glossary)
     result = {}
     for key, value in entries:
         user_prompt = (
             f"Translate this UI string to {target_language}. "
             f"Output ONLY the translated string, nothing else.\n\n{value}"
         )
-        translated = ollama_chat(base_url, model, system, user_prompt)
+        translated = ollama_chat(base_url, model, system, user_prompt, no_think)
+        # Strip any residual <think>…</think> block that leaked into the content
+        translated = re.sub(r'<think>.*?</think>\s*', '', translated, flags=re.DOTALL).strip()
         result[key] = translated
     return result
 
 # ── Interactive model picker ───────────────────────────────────────────────────
 
-def pick_model(models: list[str]) -> str:
+def pick_model(models: "list[str]") -> str:
     print(f"\n  {BOLD}Available Ollama models:{RESET}\n")
     for i, m in enumerate(models, 1):
         print(f"    {CYAN}({i}){RESET} {m}")
@@ -270,12 +373,16 @@ def print_usage():
     print(f"  --scope <key>      Only translate strings under this key (e.g. pages or pages.home)")
     print(f"  --chunk-size <n>   Strings per API call (default: {CHUNK_SIZE}). Lower = more accurate.")
     print(f"  --missing-only     Only translate keys absent or empty in the output file.")
+    print(f"  --no-think         Disable chain-of-thought reasoning (faster; for models like qwen3,")
+    print(f"                     deepseek-r1). Passes think:false to Ollama and prepends /no_think")
+    print(f"                     to the system prompt. Safe to use with non-reasoning models.")
     print()
     print(f"{BOLD}Examples:{RESET}")
     print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German --out de.json")
     print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang Spanish --out es.json --model qwen3:8b")
     print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang French  --out fr.json --scope pages.home")
     print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --missing-only")
+    print(f"  python3 i18n-translate.py en.json http://localhost:11434 --lang German  --out de.json --model qwen3:8b --no-think")
 
 def progress_bar(done: int, total: int, width: int = 36) -> str:
     pct   = done / total if total else 0
@@ -305,6 +412,7 @@ def main():
     scope      = None
     chunk_size = CHUNK_SIZE
     missing_only = False
+    no_think     = False
 
     i = 2
     while i < len(args):
@@ -319,6 +427,8 @@ def main():
             scope = args[i + 1]; i += 2
         elif a == "--missing-only":
             missing_only = True; i += 1
+        elif a == "--no-think":
+            no_think = True; i += 1
         elif a == "--chunk-size" and i + 1 < len(args):
             try:
                 chunk_size = int(args[i + 1])
@@ -385,6 +495,8 @@ def main():
         print(f"  {DIM}Scope:{RESET}     {BOLD}{scope}{RESET}")
     if missing_only:
         print(f"  {DIM}Mode:{RESET}      {YELLOW}Missing keys only{RESET}")
+    if no_think:
+        print(f"  {DIM}Reasoning:{RESET} {YELLOW}Disabled (--no-think){RESET}")
     print()
 
     # ── Build entry list ───────────────────────────────────────────────────────
@@ -436,6 +548,14 @@ def main():
     total    = len(entries)
     chunks   = [entries[i:i + chunk_size] for i in range(0, total, chunk_size)]
 
+    # Running glossary: pre-seeded from any translations already present in the
+    # output file so --missing-only runs stay consistent with prior work,
+    # then grown chunk-by-chunk during this run.
+    glossary = {}  # type: dict
+    seeded = seed_glossary_from_existing(glossary, data, out_data)
+    if seeded:
+        print(f"  {DIM}Glossary pre-seeded with {seeded} term(s) from existing translations.{RESET}\n")
+
     print(f"  Translating with {BOLD}{model}{RESET}...\n")
 
     for chunk_idx, chunk in enumerate(chunks):
@@ -443,7 +563,8 @@ def main():
         print(f"\r\033[K  {progress_bar(done, total)}  chunk {chunk_idx + 1}/{len(chunks)}", end="", flush=True)
 
         try:
-            translated_map = translate_chunk(chunk, lang, base_url, model)
+            translated_map = translate_chunk(chunk, lang, base_url, model, no_think,
+                                             glossary if glossary else None)
         except SystemExit:
             raise
         except Exception as e:
@@ -468,6 +589,10 @@ def main():
 
             done += 1
 
+        # Update the glossary with short terms from this chunk so the next
+        # chunk can reuse them for consistency.
+        update_glossary(glossary, chunk, translated_map)
+
         # Refresh progress after chunk
         print(f"\r\033[K  {progress_bar(done, total)}  chunk {chunk_idx + 1}/{len(chunks)}", end="", flush=True)
 
@@ -491,6 +616,11 @@ def main():
         f"{RED}Errors/skipped:{RESET} {errors}  "
         f"{DIM}Total: {total}{RESET}"
     )
+    if glossary:
+        total_terms = len(glossary)
+        grown = total_terms - seeded
+        if seeded and grown:
+            print(f"  {DIM}Glossary: {seeded} pre-seeded + {grown} new = {total_terms} terms{RESET}")
     print(f"\n  {GREEN}{BOLD}Output saved to {out_file}{RESET}\n")
 
 
